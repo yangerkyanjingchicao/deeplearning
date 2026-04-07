@@ -1,0 +1,418 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+import glob
+from tqdm import tqdm
+import pandas as pd
+
+# Cross-validation and evaluation metrics
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.manifold import TSNE
+
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- 1. Hyperparameters and Configuration ---
+# Relative paths for GitHub repository structure
+DATA_DIR = "./data/sentence_dataset" 
+OUTPUT_DIR = "./output/sentence_classification"
+
+TARGET_HEIGHT = 80
+TARGET_WIDTH = 128
+NUM_CLASSES = 8
+BATCH_SIZE = 16
+NUM_EPOCHS = 200
+LEARNING_RATE = 0.0005
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+K_FOLDS = 3
+TSNE_SAMPLES = 500
+TEST_SPLIT_RATIO = 0.2  # Ratio for the independent hold-out test set
+
+# --- 2. Dataset Class ---
+class PrecomputedMelSpecDataset(Dataset):
+    def __init__(self, file_list, target_height, target_width, is_train=False):
+        super().__init__()
+        self.file_list = file_list
+        self.target_height = target_height
+        self.target_width = target_width
+        self.is_train = is_train
+
+    def __len__(self):
+        return len(self.file_list)
+        
+    def __getitem__(self, idx):
+        file_path, label = self.file_list[idx]
+        # Load precomputed mel-spectrogram (Shape: C, H, W)
+        mel_spec = np.load(file_path).astype(np.float32)
+
+        # Pad or crop height to target dimension
+        if mel_spec.shape[1] != self.target_height:
+            h_diff = mel_spec.shape[1] - self.target_height
+            if h_diff > 0:
+                mel_spec = mel_spec[:, :self.target_height, :]
+            else:
+                mel_spec = np.pad(mel_spec, ((0, 0), (0, -h_diff), (0, 0)), mode='constant')
+
+        # Pad or crop width to target dimension
+        current_width = mel_spec.shape[2] 
+        if current_width > self.target_width:
+            start = np.random.randint(0, current_width - self.target_width + 1) if self.is_train else (current_width - self.target_width) // 2
+            mel_spec = mel_spec[:, :, start:start + self.target_width] 
+        elif current_width < self.target_width:
+            padding = self.target_width - current_width
+            mel_spec = np.pad(mel_spec, ((0, 0), (0, 0), (0, padding)), mode='constant')
+
+        # Min-Max Normalization
+        min_val, max_val = mel_spec.min(), mel_spec.max()
+        if max_val > min_val:
+            mel_spec = (mel_spec - min_val) / (max_val - min_val)
+            
+        feature_tensor = torch.tensor(mel_spec, dtype=torch.float32)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+        
+        return feature_tensor, label_tensor
+
+# --- 3. Model Definition ---
+class SimpleCNN2D(nn.Module):
+    def __init__(self, in_channels=3, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.cnn_layers = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1), nn.ReLU(), nn.BatchNorm2d(32), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(), nn.BatchNorm2d(64), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(), nn.BatchNorm2d(128), nn.MaxPool2d(2),
+        )
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(64, num_classes))
+
+    def forward(self, x):
+        x = self.cnn_layers(x)
+        x = self.adaptive_pool(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
+    
+    def extract_features(self, x):
+        """Extract deep features for t-SNE visualization."""
+        x = self.cnn_layers(x)
+        x = self.adaptive_pool(x)
+        return x.view(x.size(0), -1)
+
+# --- 4. Training and Evaluation Functions ---
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+    for data, labels in dataloader:
+        data, labels = data.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(data)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    return total_loss / len(dataloader), correct / total
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    with torch.no_grad():
+        for data, labels in dataloader:
+            data, labels = data.to(device), labels.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    return total_loss / len(dataloader), correct / total
+
+# --- 5. Visualization Functions ---
+def plot_curves(history, output_dir):
+    plt.figure(figsize=(18, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_acc'], label='Train Accuracy')
+    plt.plot(history['val_acc'], label='Validation Accuracy')
+    plt.title('Accuracy Curve')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Loss Curve')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.suptitle('Training and Validation Curves', fontsize=16)
+    plt.savefig(os.path.join(output_dir, "training_curves.png"))
+    plt.close()
+
+def plot_confusion_matrix(y_true, y_pred, class_names, output_dir, filename, title):
+    cm = confusion_matrix(y_true, y_pred)
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.title(title)
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.savefig(os.path.join(output_dir, filename))
+    plt.close()
+
+def plot_tsne(features, labels, title, num_classes, output_dir, filename):
+    n_samples = features.shape[0]
+    if n_samples <= 5: 
+        print(f"Warning: Too few samples ({n_samples}) for t-SNE. Skipping plot '{title}'.")
+        return None
+    
+    perplexity_value = min(30, n_samples - 1)
+    if perplexity_value < 1: 
+        perplexity_value = max(1, n_samples - 1)
+    
+    print(f"Setting perplexity to {perplexity_value} for '{title}'")
+    tsne = TSNE(n_components=2, perplexity=perplexity_value, n_iter=1000, random_state=42, init='pca', learning_rate='auto')
+    tsne_results = tsne.fit_transform(features)
+    
+    plt.figure(figsize=(12, 10))
+    sns.scatterplot(
+        x=tsne_results[:, 0], y=tsne_results[:, 1], hue=labels,
+        palette=sns.color_palette("viridis", num_classes), legend="full", alpha=0.8
+    )
+    plt.title(title)
+    plt.xlabel('t-SNE Dimension 1')
+    plt.ylabel('t-SNE Dimension 2')
+    plt.legend(title='Classes')
+    plt.savefig(os.path.join(output_dir, filename))
+    plt.close()
+    return tsne_results
+
+def get_predictions(model, dataloader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for data, labels in dataloader:
+            data, labels = data.to(device), labels.to(device)
+            outputs = model(data)
+            _, predicted = torch.max(outputs.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    return np.array(all_labels), np.array(all_preds)
+
+# --- 6. Main Pipeline ---
+if __name__ == "__main__":
+    print(f'Using device: {DEVICE}')
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"All output files will be saved to: {OUTPUT_DIR}")
+
+    # Load dataset
+    all_filepaths, all_labels = [], []
+    class_folders = sorted([f for f in glob.glob(os.path.join(DATA_DIR, "*")) if os.path.isdir(f)])
+    
+    if len(class_folders) != NUM_CLASSES:
+        print(f"Warning: Found {len(class_folders)} class folders, but NUM_CLASSES is set to {NUM_CLASSES}. Updating NUM_CLASSES.")
+        NUM_CLASSES = len(class_folders)
+    
+    class_to_idx = {os.path.basename(folder): i for i, folder in enumerate(class_folders)}
+    for class_name, class_idx in class_to_idx.items():
+        folder_path = os.path.join(DATA_DIR, class_name)
+        npy_files = glob.glob(os.path.join(folder_path, "*.npy"))
+        for file_path in npy_files: 
+            all_filepaths.append(file_path)
+            all_labels.append(class_idx)
+        
+    if not all_filepaths: 
+        raise FileNotFoundError(f"No .npy files found in {DATA_DIR}!")
+    
+    all_filepaths = np.array(all_filepaths)
+    all_labels = np.array(all_labels)
+    class_names = [name for name, idx in sorted(class_to_idx.items(), key=lambda item: item[1])]
+
+    # ==================== Step 1: Independent Test Set Split ====================
+    print("\n" + "="*20 + " Step 1: Split Independent Test Set " + "="*20)
+    
+    all_files_labels = [(all_filepaths[i], all_labels[i]) for i in range(len(all_filepaths))]
+    
+    train_val_files, test_files = train_test_split(
+        all_files_labels, 
+        test_size=TEST_SPLIT_RATIO, 
+        random_state=42, 
+        stratify=all_labels
+    )
+    
+    print(f"Data split completed:")
+    print(f"- Training & Validation Set: {len(train_val_files)} samples")
+    print(f"- Independent Test Set: {len(test_files)} samples")
+    print(f"- Split Ratio: {100*(1-TEST_SPLIT_RATIO):.0f}% Train+Val / {100*TEST_SPLIT_RATIO:.0f}% Test")
+
+    # ==================== Step 2: K-Fold Cross Validation ====================
+    print("\n" + "="*20 + f" Step 2: {K_FOLDS}-Fold Cross Validation on Train/Val Set " + "="*20)
+    
+    train_val_paths = np.array([item[0] for item in train_val_files])
+    train_val_labels = np.array([item[1] for item in train_val_files])
+    
+    skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
+    fold_results = [] 
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_val_paths, train_val_labels)):
+        print(f"\n--- FOLD {fold+1}/{K_FOLDS} ---")
+        
+        train_files_fold = [(train_val_paths[i], train_val_labels[i]) for i in train_idx]
+        val_files_fold = [(train_val_paths[i], train_val_labels[i]) for i in val_idx]
+        
+        train_dataset = PrecomputedMelSpecDataset(train_files_fold, TARGET_HEIGHT, TARGET_WIDTH, is_train=True)
+        val_dataset = PrecomputedMelSpecDataset(val_files_fold, TARGET_HEIGHT, TARGET_WIDTH, is_train=False)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        
+        model = SimpleCNN2D(num_classes=NUM_CLASSES).to(DEVICE)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+        
+        best_val_acc_fold = 0.0
+        best_model_fold_path = os.path.join(OUTPUT_DIR, f"best_model_fold_{fold+1}.pth")
+        fold_history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+
+        for epoch in range(NUM_EPOCHS):
+            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
+            val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
+            scheduler.step()
+            
+            fold_history['train_loss'].append(train_loss)
+            fold_history['train_acc'].append(train_acc)
+            fold_history['val_loss'].append(val_loss)
+            fold_history['val_acc'].append(val_acc)
+
+            if val_acc > best_val_acc_fold: 
+                best_val_acc_fold = val_acc
+                torch.save(model.state_dict(), best_model_fold_path)
+                
+        print(f"Fold {fold+1} Best Validation Accuracy: {best_val_acc_fold:.4f}")
+        
+        fold_results.append({
+            'fold': fold + 1,
+            'acc': best_val_acc_fold,
+            'path': best_model_fold_path,
+            'history': fold_history,
+            'val_files': val_files_fold
+        })
+        
+    print("\n" + "="*20 + " Cross Validation Summary " + "="*20)
+    all_fold_accs = [r['acc'] for r in fold_results]
+    mean_acc = np.mean(all_fold_accs)
+    std_acc = np.std(all_fold_accs)
+    print(f"Average Validation Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
+
+    best_fold = max(fold_results, key=lambda x: x['acc'])
+    print(f"Best Fold: Fold {best_fold['fold']} with accuracy {best_fold['acc']:.4f}")
+
+    # ==================== Step 3: Final Evaluation on Independent Test Set ====================
+    print("\n" + "="*20 + " Step 3: Evaluation on Independent Test Set " + "="*20)
+    
+    # Load best model from CV
+    best_model = SimpleCNN2D(num_classes=NUM_CLASSES).to(DEVICE)
+    best_model.load_state_dict(torch.load(best_fold['path']))
+    
+    test_dataset = PrecomputedMelSpecDataset(test_files, TARGET_HEIGHT, TARGET_WIDTH, is_train=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    
+    criterion = nn.CrossEntropyLoss()
+    test_loss, test_acc = evaluate(best_model, test_loader, criterion, DEVICE)
+    
+    print(f"\n=== Final Test Results ===")
+    print(f"Independent Test Set Accuracy: {test_acc:.4f}")
+    print(f"Independent Test Set Loss: {test_loss:.4f}")
+    
+    y_true_test, y_pred_test = get_predictions(best_model, test_loader, DEVICE)
+    
+    # Save test set predictions
+    test_results_df = pd.DataFrame({
+        'true_label': y_true_test,
+        'pred_label': y_pred_test,
+        'correct': y_true_test == y_pred_test
+    })
+    test_results_df.to_csv(os.path.join(OUTPUT_DIR, "final_test_predictions.csv"), index=False)
+
+    # ==================== Step 4: Visualizations ====================
+    print("\n" + "="*20 + " Step 4: Generating Visualizations " + "="*20)
+
+    # 1. Training curves (using the best fold's history)
+    history = best_fold['history']
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(os.path.join(OUTPUT_DIR, "best_fold_training_curves_data.csv"), index_label="Epoch")
+    plot_curves(history, OUTPUT_DIR)
+    
+    # 2. Confusion matrix (Test set)
+    plot_confusion_matrix(y_true_test, y_pred_test, class_names, OUTPUT_DIR, 
+                         "confusion_matrix_test.png", 
+                         f"Test Set Confusion Matrix (Acc: {test_acc:.2%})")
+    
+    # 3. Confusion matrix (Validation set of the best fold for comparison)
+    val_files = best_fold['val_files']
+    val_dataset_viz = PrecomputedMelSpecDataset(val_files, TARGET_HEIGHT, TARGET_WIDTH, is_train=False)
+    val_loader_viz = DataLoader(val_dataset_viz, batch_size=BATCH_SIZE, shuffle=False)
+    y_true_val, y_pred_val = get_predictions(best_model, val_loader_viz, DEVICE)
+    val_acc_viz = accuracy_score(y_true_val, y_pred_val)
+    plot_confusion_matrix(y_true_val, y_pred_val, class_names, OUTPUT_DIR,
+                         "confusion_matrix_val.png",
+                         f"Validation Set Confusion Matrix (Acc: {val_acc_viz:.2%})")
+
+    # 4. t-SNE Visualization
+    num_to_sample = min(len(test_dataset), TSNE_SAMPLES)
+    subset_indices = np.random.choice(len(test_dataset), num_to_sample, replace=False)
+    subset_data_for_tsne = [test_dataset[i] for i in subset_indices]
+    
+    # Raw features t-SNE
+    raw_features_list = []
+    tsne_labels_list = []
+    for data, label in subset_data_for_tsne:
+        raw_features_list.append(data.numpy().flatten())
+        tsne_labels_list.append(label)
+    
+    raw_features = np.array(raw_features_list)
+    tsne_labels = np.array(tsne_labels_list)
+    
+    before_tsne_results = plot_tsne(raw_features, tsne_labels, 
+                                   "t-SNE of Raw Mel Spectrograms (Test Set)", NUM_CLASSES, 
+                                   OUTPUT_DIR, "tsne_test_set_before_training.png")
+    if before_tsne_results is not None:
+        before_df = pd.DataFrame(before_tsne_results, columns=['t-SNE-1', 't-SNE-2'])
+        before_df['label'] = tsne_labels
+        before_df.to_csv(os.path.join(OUTPUT_DIR, "tsne_data_test_set_before_training.csv"), index=False)
+
+    # Extracted deep features t-SNE
+    deep_features = []
+    best_model.eval()
+    with torch.no_grad():
+        for data, _ in subset_data_for_tsne:
+            data_tensor = data.unsqueeze(0).to(DEVICE)
+            features = best_model.extract_features(data_tensor)
+            deep_features.append(features.cpu().numpy().flatten())
+    deep_features = np.array(deep_features)
+    
+    after_tsne_results = plot_tsne(deep_features, tsne_labels, 
+                                 "t-SNE of Extracted Features (Test Set)", NUM_CLASSES, 
+                                 OUTPUT_DIR, "tsne_test_set_after_training.png")
+    if after_tsne_results is not None:
+        after_df = pd.DataFrame(after_tsne_results, columns=['t-SNE-1', 't-SNE-2'])
+        after_df['label'] = tsne_labels
+        after_df.to_csv(os.path.join(OUTPUT_DIR, "tsne_data_test_set_after_training.csv"), index=False)
+
+    # ==================== Final Summary ====================
+    print("\n" + "="*50)
+    print("Experiment Completed! Summary:")
+    print(f"Cross Validation Avg Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
+    print(f"Best Fold Validation Accuracy: {best_fold['acc']:.4f}")
+    print(f"Independent Test Set Accuracy: {test_acc:.4f}")
+    print(f"\nAll results have been saved to: {OUTPUT_DIR}")
+    print("="*50)
