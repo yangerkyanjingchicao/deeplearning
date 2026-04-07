@@ -1,0 +1,135 @@
+import os
+import pandas as pd
+import numpy as np
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+
+#                      Core Functions
+def get_mel_spectrogram_from_signal(signal_numpy, sampling_rate, n_fft, hop_size, win_size, num_mels, fmin, fmax):
+    """Converts a waveform to a decibel (dB) scale Mel-spectrogram using Librosa."""
+    mel_spec_power = librosa.feature.melspectrogram(
+        y=signal_numpy, sr=sampling_rate, n_fft=n_fft, hop_length=hop_size,
+        win_length=win_size, n_mels=num_mels, fmin=fmin, fmax=fmax, center=True
+    )
+    mel_spec_db = librosa.power_to_db(mel_spec_power, ref=1.0)
+    return mel_spec_db
+
+#                        Configuration
+
+INPUT_DIR = "./data/raw_accelerometer"       # Directory containing raw .csv files
+OUTPUT_DIR = "./output/3_axis_melspectrograms" # Directory to save the 3-channel .npy files
+
+# Accelerometer Signal Parameters
+ACCEL_SAMPLING_RATE = 1000
+ACCEL_N_FFT = 128
+ACCEL_HOP_SIZE = 20
+ACCEL_WIN_SIZE = 40
+ACCEL_NUM_MELS = 80
+ACCEL_FMIN = 0
+ACCEL_FMAX = 500
+
+def process_3_axis_csv_files():
+    print("INFO: Starting to process accelerometer data to generate 3-channel Mel-spectrograms...")
+    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    if not os.path.exists(INPUT_DIR):
+        print(f"ERROR: Input directory '{INPUT_DIR}' not found!")
+        return
+
+    csv_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith('.csv')]
+    if not csv_files:
+        print(f"WARNING: No CSV files found in '{INPUT_DIR}'.")
+        return
+
+    for i, filename in enumerate(tqdm(csv_files, desc="Generating Mel-spectrograms")):
+        try:
+            input_path = os.path.join(INPUT_DIR, filename)
+            base_name = os.path.splitext(filename)[0]
+            output_path = os.path.join(OUTPUT_DIR, f"{base_name}.npy")
+
+            # --- 1. Load CSV data ---
+            df = pd.read_csv(input_path)
+            time_col = df.columns[0]
+            x_col, y_col, z_col = df.columns[1], df.columns[2], df.columns[3]
+            
+            original_time = df[time_col].values
+            original_data = df[[x_col, y_col, z_col]].values
+
+            # --- 2. Resample to a uniform time axis ---
+            new_time_axis = np.arange(0, original_time.max(), 1.0 / ACCEL_SAMPLING_RATE)
+            interpolator = interp1d(original_time, original_data, axis=0, 
+                                    bounds_error=False, fill_value=0)
+            resampled_data = interpolator(new_time_axis)
+
+            # --- 3. Extract X, Y, Z signals ---
+            # Ensure data type is float32 for librosa compatibility
+            x_signal = resampled_data[:, 0].astype(np.float32)
+            y_signal = resampled_data[:, 1].astype(np.float32)
+            z_signal = resampled_data[:, 2].astype(np.float32)
+
+            # --- 4. Generate Mel-spectrograms for each axis ---
+            common_params = {
+                "sampling_rate": ACCEL_SAMPLING_RATE, 
+                "n_fft": ACCEL_N_FFT, 
+                "hop_size": ACCEL_HOP_SIZE, 
+                "win_size": ACCEL_WIN_SIZE, 
+                "num_mels": ACCEL_NUM_MELS, 
+                "fmin": ACCEL_FMIN, 
+                "fmax": ACCEL_FMAX
+            }
+            mel_spec_x = get_mel_spectrogram_from_signal(x_signal, **common_params)
+            mel_spec_y = get_mel_spectrogram_from_signal(y_signal, **common_params)
+            mel_spec_z = get_mel_spectrogram_from_signal(z_signal, **common_params)
+
+            # --- 5. Stack the three spectrograms into a 3-channel array ---
+            # Each spectrogram has shape (num_mels, num_frames)
+            # Stacked shape becomes (3, num_mels, num_frames) representing (X, Y, Z) channels
+            multi_channel_mel = np.stack([mel_spec_x, mel_spec_y, mel_spec_z], axis=0)
+
+            # --- 6. Save the 3-channel spectrogram ---
+            np.save(output_path, multi_channel_mel)
+
+            # --- 7. (Optional) Visualize the first file for verification ---
+            if i == 0:
+                print(f"\nINFO: Visualizing the first file... New data shape: {multi_channel_mel.shape}")
+                fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True, sharey=True)
+                
+                # Display X-axis spectrogram
+                img_x = librosa.display.specshow(
+                    mel_spec_x, sr=ACCEL_SAMPLING_RATE, hop_length=ACCEL_HOP_SIZE,
+                    x_axis='time', y_axis='mel', fmin=ACCEL_FMIN, fmax=ACCEL_FMAX, ax=axs[0]
+                )
+                axs[0].set_title(f"X-Axis Mel-Spectrogram - Shape: {mel_spec_x.shape}")
+                fig.colorbar(img_x, ax=axs[0], format='%+2.0f dB')
+                
+                # Display Y-axis spectrogram
+                img_y = librosa.display.specshow(
+                    mel_spec_y, sr=ACCEL_SAMPLING_RATE, hop_length=ACCEL_HOP_SIZE,
+                    x_axis='time', y_axis='mel', fmin=ACCEL_FMIN, fmax=ACCEL_FMAX, ax=axs[1]
+                )
+                axs[1].set_title(f"Y-Axis Mel-Spectrogram - Shape: {mel_spec_y.shape}")
+                fig.colorbar(img_y, ax=axs[1], format='%+2.0f dB')
+
+                # Display Z-axis spectrogram
+                img_z = librosa.display.specshow(
+                    mel_spec_z, sr=ACCEL_SAMPLING_RATE, hop_length=ACCEL_HOP_SIZE,
+                    x_axis='time', y_axis='mel', fmin=ACCEL_FMIN, fmax=ACCEL_FMAX, ax=axs[2]
+                )
+                axs[2].set_title(f"Z-Axis Mel-Spectrogram - Shape: {mel_spec_z.shape}")
+                fig.colorbar(img_z, ax=axs[2], format='%+2.0f dB')
+                
+                fig.tight_layout()
+                plt.savefig(os.path.join(OUTPUT_DIR, "sample_visualization.png"))
+                plt.show()
+
+        except Exception as e:
+            print(f"\nERROR: Failed to process file {filename}: {e}")
+            
+    print(f"\nINFO: Processing completed! 3-channel Mel-spectrograms are saved to: {OUTPUT_DIR}")
+
+if __name__ == '__main__':
+    process_3_axis_csv_files()
