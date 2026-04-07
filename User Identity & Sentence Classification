@@ -1,0 +1,385 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+import glob
+from tqdm import tqdm
+import pandas as pd
+
+# Cross-validation and evaluation metrics
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.manifold import TSNE
+
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- 1. Hyperparameters and Configuration ---
+# Relative paths for GitHub repository structure
+DATA_DIR = "./data/dual_task_dataset"
+OUTPUT_DIR = "./output/dual_task_classification"
+
+NUM_USERS = 7
+NUM_SENTENCES = 8
+
+TARGET_HEIGHT = 80
+TARGET_WIDTH = 128
+BATCH_SIZE = 16
+NUM_EPOCHS = 200
+LEARNING_RATE = 0.0005
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+K_FOLDS = 3
+TSNE_SAMPLES = 500
+TEST_SPLIT_RATIO = 0.2  # Ratio for the independent hold-out test set
+
+# --- 2. Dataset Class ---
+class MultiTaskMelSpecDataset(Dataset):
+    def __init__(self, file_label_list, target_height, target_width, is_train=False):
+        super().__init__()
+        self.file_label_list = file_label_list
+        self.target_height = target_height
+        self.target_width = target_width
+        self.is_train = is_train
+
+    def __len__(self):
+        return len(self.file_label_list)
+
+    def __getitem__(self, idx):
+        file_path, user_label, sentence_label = self.file_label_list[idx]
+        mel_spec = np.load(file_path).astype(np.float32)
+        
+        # Dimension adjustment logic for height
+        if mel_spec.shape[1] != self.target_height:
+            h_diff = mel_spec.shape[1] - self.target_height
+            if h_diff > 0: 
+                mel_spec = mel_spec[:, :self.target_height, :]
+            else: 
+                mel_spec = np.pad(mel_spec, ((0, 0), (0, -h_diff), (0, 0)), mode='constant')
+        
+        # Dimension adjustment logic for width
+        current_width = mel_spec.shape[2]
+        if current_width > self.target_width:
+            start = np.random.randint(0, current_width - self.target_width + 1) if self.is_train else (current_width - self.target_width) // 2
+            mel_spec = mel_spec[:, :, start:start + self.target_width]
+        elif current_width < self.target_width:
+            padding = self.target_width - current_width
+            mel_spec = np.pad(mel_spec, ((0, 0), (0, 0), (0, padding)), mode='constant')
+            
+        # Min-Max Normalization
+        min_val, max_val = mel_spec.min(), mel_spec.max()
+        if max_val > min_val: 
+            mel_spec = (mel_spec - min_val) / (max_val - min_val)
+        
+        return torch.tensor(mel_spec, dtype=torch.float32), torch.tensor(user_label, dtype=torch.long), torch.tensor(sentence_label, dtype=torch.long)
+
+# --- 3. Model Definition ---
+class MultiTaskCNN(nn.Module):
+    def __init__(self, in_channels=3, num_users=NUM_USERS, num_sentences=NUM_SENTENCES):
+        super().__init__()
+        # Shared feature extractor
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1), nn.ReLU(), nn.BatchNorm2d(32), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(), nn.BatchNorm2d(64), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(), nn.BatchNorm2d(128), nn.MaxPool2d(2),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        # User ID classification branch
+        self.user_head = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.5))
+        self.user_classifier = nn.Linear(64, num_users)
+        
+        # Sentence classification branch
+        self.sentence_head = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.5))
+        self.sentence_classifier = nn.Linear(64, num_sentences)
+
+    def forward(self, x):
+        features = self.feature_extractor(x).view(x.size(0), -1)
+        return self.user_classifier(self.user_head(features)), self.sentence_classifier(self.sentence_head(features))
+
+    def extract_user_features(self, x):
+        """Extract deep features specific to the user classification task."""
+        features = self.feature_extractor(x).view(x.size(0), -1)
+        return self.user_head(features)
+
+    def extract_sentence_features(self, x):
+        """Extract deep features specific to the sentence classification task."""
+        features = self.feature_extractor(x).view(x.size(0), -1)
+        return self.sentence_head(features)
+
+# --- 4. Training and Evaluation Functions ---
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss, correct_user, correct_sentence, total = 0.0, 0, 0, 0
+    for data, user_labels, sentence_labels in dataloader:
+        data, user_labels, sentence_labels = data.to(device), user_labels.to(device), sentence_labels.to(device)
+        optimizer.zero_grad()
+        user_outputs, sentence_outputs = model(data)
+        
+        # Combined loss for multi-task learning
+        loss = criterion(user_outputs, user_labels) + criterion(sentence_outputs, sentence_labels)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        _, pred_u = torch.max(user_outputs, 1)
+        _, pred_s = torch.max(sentence_outputs, 1)
+        total += user_labels.size(0)
+        correct_user += (pred_u == user_labels).sum().item()
+        correct_sentence += (pred_s == sentence_labels).sum().item()
+        
+    return total_loss/len(dataloader), correct_user/total, correct_sentence/total
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss, correct_user, correct_sentence, total = 0.0, 0, 0, 0
+    with torch.no_grad():
+        for data, user_labels, sentence_labels in dataloader:
+            data, user_labels, sentence_labels = data.to(device), user_labels.to(device), sentence_labels.to(device)
+            user_outputs, sentence_outputs = model(data)
+            
+            loss = criterion(user_outputs, user_labels) + criterion(sentence_outputs, sentence_labels)
+            total_loss += loss.item()
+            
+            _, pred_u = torch.max(user_outputs, 1)
+            _, pred_s = torch.max(sentence_outputs, 1)
+            total += user_labels.size(0)
+            correct_user += (pred_u == user_labels).sum().item()
+            correct_sentence += (pred_s == sentence_labels).sum().item()
+            
+    return total_loss/len(dataloader), correct_user/total, correct_sentence/total
+
+# --- 5. Visualization Functions ---
+def plot_multi_task_curves(history, output_dir):
+    plt.figure(figsize=(18, 12))
+    plt.subplot(2, 2, 1)
+    plt.plot(history['train_acc_user'], label='Train User')
+    plt.plot(history['val_acc_user'], label='Val User')
+    plt.title('User Accuracy')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 2)
+    plt.plot(history['train_acc_sentence'], label='Train Sentence')
+    plt.plot(history['val_acc_sentence'], label='Val Sentence')
+    plt.title('Sentence Accuracy')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 3)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.title('Total Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.savefig(os.path.join(output_dir, "viz_model_training_curves.png"))
+    plt.close()
+    pd.DataFrame(history).to_csv(os.path.join(output_dir, "viz_model_training_history.csv"), index_label="Epoch")
+
+def plot_confusion_matrix(y_true, y_pred, class_names, output_dir, filename, title):
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(class_names)))
+    cm_normalized = cm.astype('float') / np.maximum(cm.sum(axis=1)[:, np.newaxis], 1e-9)
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.title(title)
+    plt.ylabel('True')
+    plt.xlabel('Predicted')
+    plt.savefig(os.path.join(output_dir, filename))
+    plt.close()
+
+def plot_tsne(features, labels, title, num_classes, output_dir, filename, palette="viridis"):
+    if features.shape[0] < 5: 
+        return
+    tsne = TSNE(n_components=2, perplexity=min(30, features.shape[0]-1), random_state=42, init='pca', learning_rate='auto')
+    res = tsne.fit_transform(features)
+    plt.figure(figsize=(12, 10))
+    sns.scatterplot(x=res[:,0], y=res[:,1], hue=labels, palette=sns.color_palette(palette, num_classes), legend="full", alpha=0.8)
+    plt.title(title)
+    plt.savefig(os.path.join(output_dir, filename))
+    plt.close()
+    pd.DataFrame({'t-SNE-1': res[:,0], 't-SNE-2': res[:,1], 'label': labels}).to_csv(os.path.join(output_dir, filename.replace('.png', '.csv')), index=False)
+
+def get_multi_task_predictions(model, dataloader, device):
+    model.eval()
+    u_preds, u_labels, s_preds, s_labels = [], [], [], []
+    with torch.no_grad():
+        for data, ul, sl in dataloader:
+            data = data.to(device)
+            u_out, s_out = model(data)
+            _, up = torch.max(u_out, 1)
+            _, sp = torch.max(s_out, 1)
+            u_preds.extend(up.cpu().numpy())
+            u_labels.extend(ul.cpu().numpy())
+            s_preds.extend(sp.cpu().numpy())
+            s_labels.extend(sl.cpu().numpy())
+    return np.array(u_labels), np.array(u_preds), np.array(s_labels), np.array(s_preds)
+
+# --- 6. Main Pipeline ---
+if __name__ == "__main__":
+    print(f'Using device: {DEVICE}')
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # --- 1. Load all data ---
+    all_files_labels = []
+    user_folders = sorted([d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))])
+    user_to_idx = {name: i for i, name in enumerate(user_folders)}
+    
+    # Assume uniform folder structure across users
+    first_user_path = os.path.join(DATA_DIR, user_folders[0])
+    sentence_folders = sorted([d for d in os.listdir(first_user_path) if os.path.isdir(os.path.join(first_user_path, d))], key=int)
+    sentence_to_idx = {name: i for i, name in enumerate(sentence_folders)}
+
+    for user_name, user_idx in user_to_idx.items():
+        for sentence_name, sentence_idx in sentence_to_idx.items():
+            folder_path = os.path.join(DATA_DIR, user_name, sentence_name)
+            if os.path.isdir(folder_path):
+                for file_path in glob.glob(os.path.join(folder_path, "*.npy")):
+                    all_files_labels.append((file_path, user_idx, sentence_idx))
+    
+    print(f"Total samples loaded: {len(all_files_labels)}")
+    
+    # --- 2. Core Split: Independent Test Set (Hold-out) ---
+    # Stratify using combination of user and sentence to ensure balanced distribution
+    y_stratify_all = np.array([f"{item[1]}_{item[2]}" for item in all_files_labels])
+    
+    train_val_files, final_test_files = train_test_split(
+        all_files_labels, 
+        test_size=TEST_SPLIT_RATIO, 
+        random_state=42, 
+        stratify=y_stratify_all
+    )
+    print(f"\n[Data Split Completed] Train+Val Set: {len(train_val_files)} | Final Independent Test Set: {len(final_test_files)}")
+
+    # --- 3. Pre-training Visualization (using test set samples) ---
+    print("\n" + "="*20 + " 1. Generate Pre-training t-SNE (Test Set) " + "="*20)
+    tsne_subset = final_test_files if len(final_test_files) < TSNE_SAMPLES else [final_test_files[i] for i in np.random.choice(len(final_test_files), TSNE_SAMPLES, replace=False)]
+    
+    processed_raw_features = []
+    for file_path, _, _ in tqdm(tsne_subset, desc="Preparing raw features"):
+        mel_spec = np.load(file_path).astype(np.float32)
+        if mel_spec.shape[1] > TARGET_HEIGHT: mel_spec = mel_spec[:, :TARGET_HEIGHT, :]
+        if mel_spec.shape[2] > TARGET_WIDTH: mel_spec = mel_spec[:, :, :TARGET_WIDTH]
+        elif mel_spec.shape[2] < TARGET_WIDTH: mel_spec = np.pad(mel_spec, ((0,0),(0,0),(0,TARGET_WIDTH-mel_spec.shape[2])), mode='constant')
+        processed_raw_features.append(mel_spec.flatten())
+    
+    raw_u_labels = [x[1] for x in tsne_subset]
+    raw_s_labels = [x[2] for x in tsne_subset]
+    plot_tsne(np.array(processed_raw_features), raw_u_labels, "Raw Features (Test Set) - User", NUM_USERS, OUTPUT_DIR, "tsne_raw_user.png", "tab10")
+    plot_tsne(np.array(processed_raw_features), raw_s_labels, "Raw Features (Test Set) - Sentence", NUM_SENTENCES, OUTPUT_DIR, "tsne_raw_sentence.png", "viridis")
+
+    # --- 4. K-Fold Cross Validation (on Train_Val Set) ---
+    print("\n" + "="*20 + f" 2. {K_FOLDS}-Fold Cross Validation on Train/Val Set " + "="*20)
+    y_stratify_cv = np.array([f"{item[1]}_{item[2]}" for item in train_val_files])
+    skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
+    
+    fold_results = {'user_acc': [], 'sentence_acc': []}
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(train_val_files)), y_stratify_cv)):
+        print(f"\n--- FOLD {fold+1}/{K_FOLDS} ---")
+        
+        f_train_files = [train_val_files[i] for i in train_idx]
+        f_val_files = [train_val_files[i] for i in val_idx]
+        
+        train_ds = MultiTaskMelSpecDataset(f_train_files, TARGET_HEIGHT, TARGET_WIDTH, is_train=True)
+        val_ds = MultiTaskMelSpecDataset(f_val_files, TARGET_HEIGHT, TARGET_WIDTH, is_train=False)
+        
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+        
+        model = MultiTaskCNN().to(DEVICE)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+        criterion = nn.CrossEntropyLoss()
+        
+        best_u, best_s, best_avg = 0, 0, 0
+        
+        # Set to NUM_EPOCHS for actual run
+        for epoch in range(NUM_EPOCHS): 
+            train_epoch(model, train_loader, criterion, optimizer, DEVICE)
+            _, v_u, v_s = evaluate(model, val_loader, criterion, DEVICE)
+            if (v_u + v_s)/2 > best_avg:
+                best_avg = (v_u + v_s)/2
+                best_u = v_u
+                best_s = v_s
+        
+        print(f"Fold {fold+1} Best: User={best_u:.4f}, Sentence={best_s:.4f}")
+        fold_results['user_acc'].append(best_u)
+        fold_results['sentence_acc'].append(best_s)
+
+    print(f"\nCross Validation Summary -> User Accuracy: {np.mean(fold_results['user_acc']):.4f}±{np.std(fold_results['user_acc']):.4f}")
+    print(f"Cross Validation Summary -> Sentence Accuracy: {np.mean(fold_results['sentence_acc']):.4f}±{np.std(fold_results['sentence_acc']):.4f}")
+
+    # --- 5. Final Model Training and Evaluation ---
+    print("\n" + "="*20 + " 3. Final Full Training and Independent Test Set Evaluation " + "="*20)
+    
+    # Create an internal validation set to generate training curves
+    tv_train_files, tv_val_files = train_test_split(train_val_files, test_size=0.1, random_state=42, stratify=y_stratify_cv)
+    
+    final_train_ds = MultiTaskMelSpecDataset(tv_train_files, TARGET_HEIGHT, TARGET_WIDTH, is_train=True)
+    final_val_ds = MultiTaskMelSpecDataset(tv_val_files, TARGET_HEIGHT, TARGET_WIDTH, is_train=False) 
+    final_test_ds = MultiTaskMelSpecDataset(final_test_files, TARGET_HEIGHT, TARGET_WIDTH, is_train=False) 
+    
+    final_train_loader = DataLoader(final_train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    final_val_loader = DataLoader(final_val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    final_test_loader = DataLoader(final_test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    
+    model_final = MultiTaskCNN().to(DEVICE)
+    optimizer = torch.optim.AdamW(model_final.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    criterion = nn.CrossEntropyLoss()
+    
+    history = {'train_loss':[],'val_loss':[],'train_acc_user':[],'val_acc_user':[],'train_acc_sentence':[],'val_acc_sentence':[]}
+    best_avg_acc = 0.0
+    best_model_path = os.path.join(OUTPUT_DIR, "best_final_model.pth")
+    
+    for epoch in tqdm(range(NUM_EPOCHS), desc="Final Training"):
+        tl, tu, ts = train_epoch(model_final, final_train_loader, criterion, optimizer, DEVICE)
+        vl, vu, vs = evaluate(model_final, final_val_loader, criterion, DEVICE) 
+        scheduler.step()
+        
+        history['train_loss'].append(tl); history['val_loss'].append(vl)
+        history['train_acc_user'].append(tu); history['val_acc_user'].append(vu)
+        history['train_acc_sentence'].append(ts); history['val_acc_sentence'].append(vs)
+        
+        if (vu + vs)/2 > best_avg_acc:
+            best_avg_acc = (vu + vs)/2
+            torch.save(model_final.state_dict(), best_model_path)
+            
+    plot_multi_task_curves(history, OUTPUT_DIR)
+    
+    # --- 6. Generate Results on Independent Test Set ---
+    print("Loading best model for independent test set evaluation...")
+    model_final.load_state_dict(torch.load(best_model_path))
+    
+    true_u, pred_u, true_s, pred_s = get_multi_task_predictions(model_final, final_test_loader, DEVICE)
+    
+    final_acc_u = accuracy_score(true_u, pred_u)
+    final_acc_s = accuracy_score(true_s, pred_s)
+    print(f"\nFinal Independent Test Set Accuracy -> User: {final_acc_u:.4f}, Sentence: {final_acc_s:.4f}")
+    
+    # Save predictions
+    pd.DataFrame({'true_user': true_u, 'pred_user': pred_u, 'true_sentence': true_s, 'pred_sentence': pred_s}).to_csv(os.path.join(OUTPUT_DIR, "final_test_predictions.csv"), index=False)
+    
+    # Plot confusion matrices
+    user_names = list(user_to_idx.keys())
+    sentence_names = list(sentence_to_idx.keys())
+    plot_confusion_matrix(true_u, pred_u, user_names, OUTPUT_DIR, "cm_test_user.png", f"Test Set Confusion Matrix - User (Acc: {final_acc_u:.2%})")
+    plot_confusion_matrix(true_s, pred_s, sentence_names, OUTPUT_DIR, "cm_test_sentence.png", f"Test Set Confusion Matrix - Sentence (Acc: {final_acc_s:.2%})")
+
+    # Plot Post-training t-SNE
+    user_feats, sent_feats, l_u, l_s = [], [], [], []
+    model_final.eval()
+    with torch.no_grad():
+        tsne_test_subset = final_test_files if len(final_test_files) < TSNE_SAMPLES else [final_test_files[i] for i in np.random.choice(len(final_test_files), TSNE_SAMPLES, replace=False)]
+        ds_tsne = MultiTaskMelSpecDataset(tsne_test_subset, TARGET_HEIGHT, TARGET_WIDTH, is_train=False)
+        for data, u_lab, s_lab in ds_tsne:
+            data = data.unsqueeze(0).to(DEVICE)
+            user_feats.append(model_final.extract_user_features(data).cpu().numpy().flatten())
+            sent_feats.append(model_final.extract_sentence_features(data).cpu().numpy().flatten())
+            l_u.append(u_lab.item())
+            l_s.append(s_lab.item())
+            
+    plot_tsne(np.array(user_feats), l_u, "Deep Features (Test Set) - User", NUM_USERS, OUTPUT_DIR, "tsne_deep_user.png", "tab10")
+    plot_tsne(np.array(sent_feats), l_s, "Deep Features (Test Set) - Sentence", NUM_SENTENCES, OUTPUT_DIR, "tsne_deep_sentence.png", "viridis")
+    
+    print("\nAll standard procedures completed successfully. Results are saved and ready for publication.")
